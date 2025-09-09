@@ -16,10 +16,6 @@
 4. Set a secure password when creating the database
 5. In `.env` file, replace `your_neo4j_password` with your database password
 
-## Environment Variables
-
-Copy the `.env.example` file to `.env` and fill in your credentials:
-
 ```
 OPENAI_API_KEY=sk-...your-key-here...
 NEO4J_PASSWORD=your-database-password
