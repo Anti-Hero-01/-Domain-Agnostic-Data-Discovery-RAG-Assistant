@@ -1,0 +1,155 @@
+{
+  "directed": true,
+  "multigraph": true,
+  "graph": {},
+  "nodes": [
+    {
+      "type": "entity",
+      "id": "Kotwal"
+    },
+    {
+      "type": "entity",
+      "id": "9822536500"
+    },
+    {
+      "type": "entity",
+      "id": "biodiversity"
+    },
+    {
+      "type": "entity",
+      "id": "seeds"
+    },
+    {
+      "type": "entity",
+      "id": "filtering"
+    },
+    {
+      "type": "entity",
+      "id": "features"
+    },
+    {
+      "type": "entity",
+      "id": "System"
+    },
+    {
+      "type": "entity",
+      "id": "capture"
+    },
+    {
+      "type": "entity",
+      "id": "attendance"
+    },
+    {
+      "type": "entity",
+      "id": "dashboard"
+    },
+    {
+      "type": "entity",
+      "id": "Languages"
+    },
+    {
+      "type": "entity",
+      "id": "ElectroQuest"
+    },
+    {
+      "type": "entity",
+      "id": "PASC"
+    },
+    {
+      "type": "entity",
+      "id": "1630"
+    },
+    {
+      "type": "entity",
+      "id": "Learning"
+    },
+    {
+      "type": "entity",
+      "id": "Ng"
+    },
+    {
+      "type": "entity",
+      "id": "Member"
+    },
+    {
+      "type": "entity",
+      "id": "responsibility"
+    },
+    {
+      "type": "entity",
+      "id": "workshops"
+    }
+  ],
+  "links": [
+    {
+      "relation": "+91",
+      "source_doc": 8,
+      "source": "Kotwal",
+      "target": "9822536500",
+      "key": "+91"
+    },
+    {
+      "relation": "develop",
+      "source_doc": 8,
+      "source": "biodiversity",
+      "target": "seeds",
+      "key": "develop"
+    },
+    {
+      "relation": "dashboard",
+      "source_doc": 8,
+      "source": "filtering",
+      "target": "features",
+      "key": "dashboard"
+    },
+    {
+      "relation": "•",
+      "source_doc": 8,
+      "source": "System",
+      "target": "capture",
+      "key": "•"
+    },
+    {
+      "relation": "log",
+      "source_doc": 8,
+      "source": "attendance",
+      "target": "dashboard",
+      "key": "log"
+    },
+    {
+      "relation": "•",
+      "source_doc": 8,
+      "source": "Languages",
+      "target": "ElectroQuest",
+      "key": "•"
+    },
+    {
+      "relation": "•",
+      "source_doc": 8,
+      "source": "PASC",
+      "target": "1630",
+      "key": "•"
+    },
+    {
+      "relation": "cover",
+      "source_doc": 8,
+      "source": "Learning",
+      "target": "Ng",
+      "key": "cover"
+    },
+    {
+      "relation": "contribute",
+      "source_doc": 8,
+      "source": "Member",
+      "target": "responsibility",
+      "key": "contribute"
+    },
+    {
+      "relation": "participate",
+      "source_doc": 8,
+      "source": "Member",
+      "target": "workshops",
+      "key": "participate"
+    }
+  ]
+}
