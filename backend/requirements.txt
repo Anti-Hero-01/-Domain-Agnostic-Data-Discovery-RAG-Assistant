@@ -23,4 +23,6 @@ transformers
 torch
 pydantic_settings
 pytest
+streamlit
+matplotlib
 

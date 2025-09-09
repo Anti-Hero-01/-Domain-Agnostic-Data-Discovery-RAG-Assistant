@@ -22,24 +22,24 @@ class DocumentProcessor:
         self.vector_store.add_document(content)
         
         return {
-            "filename": file.filename,
+            "filename": file.name,  # <-- Changed from file.filename
             "entities": entities,
             "status": "processed"
         }
 
     async def _extract_content(self, file) -> str:
-        ext = file.filename.split(".")[-1].lower()
+        ext = file.name.split(".")[-1].lower()  # <-- Changed from file.filename
         content = ""
         
         if ext == "pdf":
-            with pdfplumber.open(file.file) as pdf:
+            with pdfplumber.open(file) as pdf:  # file.file is optional; pdfplumber can take UploadedFile
                 for page in pdf.pages:
-                    content += page.extract_text()
+                    content += page.extract_text() or ""
         elif ext == "txt":
             content = await file.read()
             content = content.decode("utf-8")
         elif ext in ["xlsx", "xls"]:
-            df = pd.read_excel(file.file)
+            df = pd.read_excel(file)  # UploadedFile works directly with pandas
             content = df.to_string()
         
         return content
