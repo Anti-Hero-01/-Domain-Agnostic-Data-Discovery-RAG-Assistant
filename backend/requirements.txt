@@ -21,4 +21,6 @@ tiktoken
 beautifulsoup4
 transformers
 torch
+pydantic_settings
+pytest
 

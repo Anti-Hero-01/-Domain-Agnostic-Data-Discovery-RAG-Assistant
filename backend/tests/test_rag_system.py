@@ -1,10 +1,10 @@
 import asyncio
-import os
-from fastapi import UploadFile
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
 from services.document_processor import DocumentProcessor
 from services.rag_pipeline import RAGPipeline
-import pytest
-from pathlib import Path
+
 
 async def test_document_processing():
     # Initialize processor
@@ -20,14 +20,14 @@ async def test_document_processing():
     test_file_path = Path("test_document.txt")
     test_file_path.write_text(test_content)
     
-    # Create mock UploadFile
+    # Create mock UploadFile-like object
     class MockFile:
         def __init__(self, filename, content):
             self.filename = filename
             self._content = content
             
         async def read(self):
-            return self._content.encode('utf-8')
+            return self._content.encode("utf-8")
             
         @property
         def file(self):
@@ -41,13 +41,38 @@ async def test_document_processing():
     assert "entities" in result
     assert "filename" in result
     assert result["status"] == "processed"
-    
-    # Test RAG pipeline
-    rag = RAGPipeline()
-    test_question = "Who is the CEO of Apple?"
-    answer = await rag.process_query(test_question)
+
+    # --- Mock OpenAI API and RAGPipeline dependencies ---
+    with patch("services.rag_pipeline.OpenAI") as mock_openai:
+        mock_client = mock_openai.return_value
+
+        # Mock response structure for OpenAI chat completion
+        mock_message = Mock()
+        mock_message.content = "Tim Cook is the CEO of Apple."
+        mock_choice = Mock()
+        mock_choice.message = mock_message
+        mock_choice.finish_reason = "stop"
+
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=Mock(choices=[mock_choice])
+        )
+
+        # Create RAGPipeline instance with mocked OpenAI client
+        rag = RAGPipeline(openai_client=mock_client)
+
+        # Mock KnowledgeGraph and VectorStore at instance level
+        rag.kg = Mock()
+        rag.kg.query_subgraph.return_value = [{"type": "CEO", "value": "Tim Cook"}]
+
+        rag.vector_store = Mock()
+        rag.vector_store.search.return_value = [{"content": "Apple is a tech company.", "score": 0.95}]
+
+        # Run RAG query
+        test_question = "Who is the CEO of Apple?"
+        answer = await rag.process_query(test_question)
     
     # Verify RAG response
+    assert isinstance(answer, dict)
     assert "answer" in answer
     assert "sources" in answer
     assert "confidence" in answer
@@ -58,6 +83,7 @@ async def test_document_processing():
 
     return result, answer
 
+
 if __name__ == "__main__":
     # Run the test
     result, answer = asyncio.run(test_document_processing())
@@ -66,7 +92,7 @@ if __name__ == "__main__":
     print("==========================")
     print(f"Filename: {result['filename']}")
     print("\nExtracted Entities:")
-    for entity_type, entities in result['entities'].items():
+    for entity_type, entities in result["entities"].items():
         print(f"{entity_type}: {', '.join(entities)}")
     
     print("\nRAG Pipeline Result:")
@@ -74,5 +100,5 @@ if __name__ == "__main__":
     print(f"Answer: {answer['answer']}")
     print(f"Confidence: {answer['confidence']}")
     print("\nSources:")
-    for source in answer['sources']:
+    for source in answer["sources"]:
         print(f"- {source}")
