@@ -28,9 +28,9 @@ import PyPDF2, pandas as pd
 # Embeddings + LLM
 from sentence_transformers import SentenceTransformer
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    TextIteratorStreamer, 
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TextIteratorStreamer,
     GenerationConfig
 )
 
@@ -143,7 +143,7 @@ _next_doc_id, _doc_id_lock = 1, Lock()
 def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     """Split text into overlapping chunks."""
     sents = _SENT_SPLIT_RE.split(text.strip())
-    chunks, cur = [], ""
+    chunks, cur = "", ""
     for s in sents:
         if not s:
             continue
@@ -183,7 +183,7 @@ def add_documents(texts):
         all_chunks.extend(chunk_text(t))
     if not all_chunks:
         return 0
-    
+
     embs = embed_texts(all_chunks)
     ids = _get_next_doc_ids(len(all_chunks))
 
@@ -346,23 +346,23 @@ with gr.Blocks(title="Domain-Agnostic RAG Assistant") as demo:
 
     # Chat handler
     def handle_q(q, hist, d, r):
-    if not q:
+        if not q:
+            return hist
+
+        ctx = search(q, domain=d, role=r)
+        prompt = build_prompt(ctx, q)
+        streamer = generate_stream(prompt)
+
+        hist = hist + [[q, ""]]
+        out = ""
+
+        for token in streamer:
+            out += token
+            hist[-1][1] = out
+            yield hist  # update chatbot continuously
+
+        hist[-1][1] = out  # finalize answer
         return hist
-
-    ctx = search(q, domain=d, role=r)
-    prompt = build_prompt(ctx, q)
-    streamer = generate_stream(prompt)
-
-    hist = hist + [[q, ""]]
-    out = ""
-
-    for token in streamer:
-        out += token
-        hist[-1][1] = out
-        yield hist  # update chatbot continuously
-
-    hist[-1][1] = out  # finalize answer
-    return hist
 
     # Bind chat interactions
     qbox.submit(handle_q, [qbox, chat, domain, role], [chat])
