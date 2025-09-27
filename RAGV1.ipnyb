@@ -1,0 +1,374 @@
+# ==============================================================
+#  Domain-Agnostic RAG (Retrieval-Augmented Generation) Assistant
+# ==============================================================
+# Features:
+# - Upload and parse documents (PDF, TXT, XLSX)
+# - Chunk text into manageable pieces
+# - Generate embeddings with SentenceTransformer
+# - Store and retrieve embeddings using FAISS + Qdrant
+# - Build prompts with retrieved context
+# - Use Qwen2.5-7B-Instruct as the LLM for answering
+# - Simple UI built with Gradio
+# ==============================================================
+# ---------------- V1-Setup ----------------
+!pip install -q "transformers>=4.37.0" "accelerate>=0.24.0" "bitsandbytes>=0.41.0" \
+    "gradio>=4.13.0" "sentence-transformers>=2.2.2" "faiss-cpu>=1.7.4" "pypdf2>=3.0.0" \
+    "qdrant-client>=1.5.0" "openpyxl>=3.0.0" "pandas>=2.0.0"
+
+# ------------------------------
+#  Imports
+# ------------------------------
+import os, re, time, threading
+from threading import Lock, Thread
+import numpy as np
+import torch, faiss
+import gradio as gr
+import PyPDF2, pandas as pd
+
+# Embeddings + LLM
+from sentence_transformers import SentenceTransformer
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    TextIteratorStreamer, 
+    GenerationConfig
+)
+
+# Vector Database (Qdrant)
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams, Distance, PointStruct
+
+
+# ------------------------------
+#  Configuration
+# ------------------------------
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# CUDA performance tuning
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Chunking parameters
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 120
+
+# Retrieval settings
+TOP_K = 3
+LOCAL_CACHE_MAX = 2000
+QDRANT_COLLECTION = "rag_docs"
+
+# Qdrant credentials
+os.environ["QDRANT_URL"] = "https://5270ded7-d2c9-40d8-a849-3341f4eee33a.us-west-1-0.aws.cloud.qdrant.io/"
+os.environ["QDRANT_API_KEY"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.N1K1YMC_lH2WzHV6D4klOc55rJFtQJXScwVvQCSZfVc"
+QDRANT_URL = os.environ.get("QDRANT_URL")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+
+if not QDRANT_URL or not QDRANT_API_KEY:
+    raise RuntimeError("Please set QDRANT_URL and QDRANT_API_KEY env vars.")
+
+
+# ------------------------------
+#  Global Variables
+# ------------------------------
+index_lock = Lock()
+doc_store, doc_ids = [], []
+doc_embeddings = None
+faiss_index = None
+
+
+# ------------------------------
+#  Load Models
+# ------------------------------
+print("Loading models...")
+t0 = time.time()
+
+# SentenceTransformer embeddings
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=DEVICE)
+embed_dim = embedder.get_sentence_embedding_dimension()
+
+# Local FAISS index for fast similarity search
+faiss_index = faiss.IndexFlatIP(embed_dim)
+
+# Large Language Model (LLM) - Qwen2.5-7B-Instruct
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, padding_side="left")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    device_map="auto",
+    load_in_4bit=True,          # memory efficient loading
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+    trust_remote_code=True
+)
+model.eval()
+
+# Text generation configuration
+generation_config = GenerationConfig(
+    max_new_tokens=512,  # increased from 256
+    do_sample=False,
+    temperature=0.0,
+    top_p=0.9,
+    top_k=40,
+    repetition_penalty=1.05,
+    pad_token_id=tokenizer.eos_token_id
+)
+
+print("Models loaded in {:.2f}s".format(time.time()-t0))
+
+
+# ------------------------------
+#  Qdrant Setup
+# ------------------------------
+qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+def ensure_qdrant_collection():
+    """Ensure collection exists in Qdrant, else create it."""
+    collections = [c.name for c in qdrant.get_collections().collections]
+    if QDRANT_COLLECTION not in collections:
+        qdrant.recreate_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE)
+        )
+
+ensure_qdrant_collection()
+
+
+# ------------------------------
+#  Utilities
+# ------------------------------
+_SENT_SPLIT_RE = re.compile(r'(?<=[\.\?\!。\n])\s+')
+_next_doc_id, _doc_id_lock = 1, Lock()
+
+def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split text into overlapping chunks."""
+    sents = _SENT_SPLIT_RE.split(text.strip())
+    chunks, cur = [], ""
+    for s in sents:
+        if not s:
+            continue
+        if len(cur) + len(s) <= chunk_size:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur: chunks.append(cur)
+            cur = (cur[-overlap:] + " " + s).strip() if cur else s
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+def embed_texts(texts, batch_size=64):
+    """Generate normalized embeddings for texts."""
+    embs = embedder.encode(texts, convert_to_numpy=True, batch_size=batch_size, show_progress_bar=False)
+    embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12)
+    return embs.astype(np.float32)
+
+def _get_next_doc_ids(n):
+    """Generate unique document IDs."""
+    global _next_doc_id
+    with _doc_id_lock:
+        start = _next_doc_id
+        ids = list(range(start, start+n))
+        _next_doc_id += n
+    return ids
+
+
+# ------------------------------
+#  Document Ingestion
+# ------------------------------
+def add_documents(texts):
+    """Add documents to FAISS + Qdrant."""
+    global doc_store, doc_embeddings, doc_ids
+    all_chunks = []
+    for t in texts:
+        all_chunks.extend(chunk_text(t))
+    if not all_chunks:
+        return 0
+    
+    embs = embed_texts(all_chunks)
+    ids = _get_next_doc_ids(len(all_chunks))
+
+    # Async upsert into Qdrant
+    def qdrant_upsert():
+        pts = [PointStruct(id=i, vector=embs[j].tolist(), payload={"text": all_chunks[j]}) for j, i in enumerate(ids)]
+        qdrant.upsert(collection_name=QDRANT_COLLECTION, points=pts)
+    Thread(target=qdrant_upsert, daemon=True).start()
+
+    # Add to FAISS + local cache
+    with index_lock:
+        doc_store.extend(all_chunks)
+        doc_ids.extend(ids)
+        doc_embeddings = embs if doc_embeddings is None else np.vstack([doc_embeddings, embs])
+        faiss_index.add(embs)
+
+        # Trim cache if too large
+        if len(doc_store) > LOCAL_CACHE_MAX:
+            doc_store = doc_store[-LOCAL_CACHE_MAX:]
+            doc_ids = doc_ids[-LOCAL_CACHE_MAX:]
+            doc_embeddings = doc_embeddings[-LOCAL_CACHE_MAX:]
+            faiss_index.reset()
+            faiss_index.add(doc_embeddings)
+
+    return len(all_chunks)
+
+
+# ------------------------------
+#  Graph Placeholder
+# ------------------------------
+def extract_graph(texts):
+    """Simple entity extraction demo (placeholder)."""
+    graph = {"entities": [], "attributes": [], "relationships": []}
+    for i, t in enumerate(texts[:5]):
+        graph["entities"].append({"id": i, "name": f"Entity{i}", "samples": [t[:50]]})
+    return graph
+
+
+# ------------------------------
+#  Search / Retrieval
+# ------------------------------
+def search(query, domain=None, role=None, top_k=TOP_K, qdrant_threshold=0.45):
+    """Search local FAISS first, then fallback to Qdrant if needed."""
+    q_emb = embed_texts([query])
+    results = []
+
+    # Local FAISS search
+    with index_lock:
+        if faiss_index.ntotal > 0:
+            scores, I = faiss_index.search(q_emb, min(top_k, faiss_index.ntotal))
+            for sc, idx in zip(scores[0], I[0]):
+                if idx >= 0:
+                    results.append((doc_store[idx], float(sc)))
+
+    # Use local results if confident
+    if results and results[0][1] >= qdrant_threshold:
+        return [t for t, _ in results]
+
+    # Otherwise query Qdrant
+    qres = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=q_emb[0].tolist(), limit=top_k)
+    texts = [p.payload.get("text", "") for p in qres]
+    if texts:
+        Thread(target=lambda: add_documents(texts), daemon=True).start()
+    return texts or ["No context"]
+
+
+# ------------------------------
+#  Prompt Construction
+# ------------------------------
+def build_prompt(contexts, q):
+    """Build prompt with context for LLM."""
+    sys = "You are a helpful assistant. Use context if relevant."
+    ctx = "\n\n".join([f"Context {i+1}:\n{c}" for i, c in enumerate(contexts) if c.strip()])
+    return f"{sys}\n\n{ctx}\n\nUser: {q}\nAnswer:"
+
+
+# ------------------------------
+#  LLM Generation
+# ------------------------------
+def generate_stream(prompt):
+    """Stream LLM output token by token."""
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1600).to(model.device)
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    def run():
+        with torch.inference_mode():
+            model.generate(**inputs, generation_config=generation_config, streamer=streamer)
+
+    Thread(target=run, daemon=True).start()
+    return streamer
+
+
+# ------------------------------
+#  File Handlers
+# ------------------------------
+def handle_pdf(f):
+    """Parse PDF and add to store."""
+    try:
+        r = PyPDF2.PdfReader(f.name)
+        texts = [p.extract_text() for p in r.pages if p.extract_text()]
+        n = add_documents(texts)
+        graph = extract_graph(texts)
+        return f"Added {n} chunks", graph
+    except Exception as e:
+        return f"Error: {e}", {}
+
+def handle_txt(f):
+    """Parse TXT and add to store."""
+    try:
+        with open(f.name, "r", encoding="utf-8") as file:
+            text = file.read()
+        n = add_documents([text])
+        graph = extract_graph([text])
+        return f"Added {n} chunks", graph
+    except Exception as e:
+        return f"Error: {e}", {}
+
+def handle_xlsx(f):
+    """Parse XLSX and add to store."""
+    try:
+        df = pd.read_excel(f.name)
+        texts = [str(df.iloc[i, :].to_dict()) for i in range(len(df))]
+        n = add_documents(texts)
+        graph = extract_graph(texts)
+        return f"Added {n} chunks", graph
+    except Exception as e:
+        return f"Error: {e}", {}
+
+
+# ------------------------------
+#  Gradio UI
+# ------------------------------
+with gr.Blocks(title="Domain-Agnostic RAG Assistant") as demo:
+    gr.Markdown("# ⚡ RAG + Graph Chat Assistant")
+
+    # Domain/Role Selection
+    with gr.Row():
+        domain = gr.Dropdown(choices=["Retail", "Legal", "Healthcare"], label="Select Domain")
+        role = gr.Dropdown(choices=["Analyst", "Manager", "Developer"], label="Select Role")
+
+    # Upload Tab
+    with gr.Tab("Upload"):
+        pdf_file = gr.File(file_types=[".pdf"], label="Upload PDF")
+        txt_file = gr.File(file_types=[".txt"], label="Upload TXT")
+        xlsx_file = gr.File(file_types=[".xlsx"], label="Upload XLSX")
+        status_box = gr.Textbox(label="Status")
+        graph_box = gr.JSON(label="Extracted Graph")
+
+    # Chat Tab
+    with gr.Tab("Chat"):
+        chat = gr.Chatbot()
+        qbox = gr.Textbox(label="Ask", lines=2)
+        btn = gr.Button("Send")
+        resp = gr.Textbox(label="Partial Response")
+
+    # Bind file upload handlers
+    pdf_file.upload(handle_pdf, pdf_file, [status_box, graph_box])
+    txt_file.upload(handle_txt, txt_file, [status_box, graph_box])
+    xlsx_file.upload(handle_xlsx, xlsx_file, [status_box, graph_box])
+
+    # Chat handler
+    def handle_q(q, hist, d, r):
+    if not q:
+        return hist
+
+    ctx = search(q, domain=d, role=r)
+    prompt = build_prompt(ctx, q)
+    streamer = generate_stream(prompt)
+
+    hist = hist + [[q, ""]]
+    out = ""
+
+    for token in streamer:
+        out += token
+        hist[-1][1] = out
+        yield hist  # update chatbot continuously
+
+    hist[-1][1] = out  # finalize answer
+    return hist
+
+    # Bind chat interactions
+    qbox.submit(handle_q, [qbox, chat, domain, role], [chat])
+    btn.click(handle_q, [qbox, chat, domain, role], [chat])
+
+# ------------------------------
+#  Launch App
+# ------------------------------
+demo.launch(share=True, debug=True)
